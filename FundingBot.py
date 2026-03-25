@@ -5,129 +5,90 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 import ccxt.async_support as ccxt
 
-# --- [НАСТРОЙКИ] ---
+# --- [КОНФИГ] ---
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
-API_TOKEN = '8701958512:AAHn1_Eq1MDIaeU7F6wuxTBXX33mgRkXzXM'
+API_TOKEN = 'ТВОЙ_ТОКЕН'
 
-# Глобальные объекты бирж (создаем один раз)
 EXCHANGE_CONFIG = {
-    'enableRateLimit': True, 
-    'timeout': 20000,
-    'headers': {'User-Agent': 'Mozilla/5.0...'}
+    'enableRateLimit': True,
+    'headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 }
+
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher()
 binance = ccxt.binance(EXCHANGE_CONFIG)
 mexc = ccxt.mexc(EXCHANGE_CONFIG)
 
-logging.basicConfig(level=logging.INFO)
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher()
-
-# Хранилище общих пар
-common_pairs = []
-
-async def get_common_pairs():
-    """Функция парсинга общих монет (один раз при старте)"""
-    global common_pairs
-    if common_pairs: return common_pairs # Если уже спарсили, возвращаем кэш
-
-    print("📡 Загружаем рынки...")
+async def get_all_spreads():
     try:
+        # 1. Загружаем рынки (если еще не загружены)
         await asyncio.gather(binance.load_markets(), mexc.load_markets())
+        
+        # 2. Находим ВСЕ общие пары USDT
         b_pairs = {s for s in binance.symbols if '/USDT' in s and ':' not in s}
         m_pairs = {s for s in mexc.symbols if '/USDT' in s and ':' not in s}
-        common_pairs = sorted(list(b_pairs.intersection(m_pairs)))
-        return common_pairs
-    except Exception as e:
-        logging.error(f"Ошибка загрузки рынков: {e}")
-        return []
+        common = list(b_pairs.intersection(m_pairs))
 
-async def check_spread(symbol):
-    """Запрос цен и расчет спреда для ОДНОЙ пары"""
-    try:
-        # Запрашиваем стаканы (Order Book) параллельно для скорости
-        # Нам нужны лучшие цены: ask (покупка) и bid (продажа)
-        b_ticker, m_ticker = await asyncio.gather(
-            binance.fetch_ticker(symbol),
-            mexc.fetch_ticker(symbol)
+        # 3. ПОЛУЧАЕМ ВСЕ ЦЕНЫ ОДНИМ МАХОМ (fetch_tickers)
+        # Это в сотни раз быстрее, чем цикл
+        print(f"📡 Запрашиваю цены для {len(common)} монет...")
+        b_tickers, m_tickers = await asyncio.gather(
+            binance.fetch_tickers(common),
+            mexc.fetch_tickers(common)
         )
-        
-        results = []
 
-        # Направление 1: Купить B, Продать M
-        b_ask = b_ticker['ask']
-        m_bid = m_ticker['bid']
-        if b_ask and m_bid:
-            spread1 = ((m_bid - b_ask) / b_ask) * 100
-            if spread1 > 0.01: # Фильтруем только положительный спред
-                results.append((symbol, "Binance", "MEXC", b_ask, m_bid, spread1))
+        spreads = []
 
-        # Направление 2: Купить M, Продать B
-        m_ask = m_ticker['ask']
-        b_bid = b_ticker['bid']
-        if m_ask and b_bid:
-            spread2 = ((b_bid - m_ask) / m_ask) * 100
-            if spread2 > 0.01:
-                results.append((symbol, "MEXC", "Binance", m_ask, b_bid, spread2))
-        
-        return results
+        for symbol in common:
+            if symbol in b_tickers and symbol in m_tickers:
+                bt = b_tickers[symbol]
+                mt = m_tickers[symbol]
+
+                # Проверяем наличие цен (ask/bid)
+                if not (bt['ask'] and bt['bid'] and mt['ask'] and mt['bid']):
+                    continue
+
+                # Направление: Купить на Binance -> Продать на MEXC
+                s1 = ((mt['bid'] - bt['ask']) / bt['ask']) * 100
+                if s1 > 0.1: # Порог 0.1%
+                    spreads.append({'sym': symbol, 'buy': 'Binance', 'sell': 'MEXC', 'price_b': bt['ask'], 'price_s': mt['bid'], 'val': s1})
+
+                # Направление: Купить на MEXC -> Продать на Binance
+                s2 = ((bt['bid'] - mt['ask']) / mt['ask']) * 100
+                if s2 > 0.1:
+                    spreads.append({'sym': symbol, 'buy': 'MEXC', 'sell': 'Binance', 'price_b': mt['ask'], 'price_s': bt['bid'], 'val': s2})
+
+        # Сортируем: самые жирные спреды вверху
+        spreads.sort(key=lambda x: x['val'], reverse=True)
+        return spreads
 
     except Exception as e:
-        #logging.error(f"Ошибка запроса цен {symbol}: {e}")
+        logging.error(f"Ошибка сканера: {e}")
         return []
-
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    await message.answer("Я готов! Напиши `/scan` для поиска спреда между Binance и MEXC.\n*(Кэш общих пар загрузится при первом запуске)*", parse_mode="Markdown")
 
 @dp.message(Command("scan"))
 async def cmd_scan(message: types.Message):
-    global common_pairs
-    status_msg = await message.answer("🔄 Запускаю сканер... Это может занять около 30 сек.")
+    msg = await message.answer("🔍 Сканирую весь рынок (Binance + MEXC)...")
     
-    # Гарантируем, что пары загружены
-    if not common_pairs:
-        await status_msg.edit_text("⏳ Загружаю список общих пар (первый запуск)...")
-        pairs = await get_common_pairs()
-        if not pairs:
-            await status_msg.edit_text("❌ Ошибка загрузки рынков. Проверь прокси/IP.")
-            return
-
-    found_spreads = []
+    all_found = await get_all_spreads()
     
-    # Чтобы не получить бан за спам запросами, сканируем только первые 20 пар
-    # И делаем небольшую паузу между запросами
-    pairs_to_scan = common_pairs[:20] 
-    
-    for i, symbol in enumerate(pairs_to_scan):
-        await status_msg.edit_text(f"📊 Сканирую {i+1}/{len(pairs_to_scan)}: **{symbol}**", parse_mode="Markdown")
-        spread_info = await check_spread(symbol)
-        if spread_info:
-            found_spreads.extend(spread_info)
-        await asyncio.sleep(0.5) # Пауза 500мс между запросами
+    if not all_found:
+        await msg.edit_text("☹️ Хороших спредов (>0.1%) сейчас нет.")
+        return
 
-    # Сортируем по размеру спреда (от большего к меньшему)
-    found_spreads.sort(key=lambda x: x[5], reverse=True)
+    # Формируем отчет (Топ-15 самых выгодных)
+    response = f"🚀 **Найдено спредов: {len(all_found)}**\n\n"
+    for s in all_found[:15]:
+        line = (f"💰 `{s['val']:.2f}%` | **{s['sym'].split('/')[0]}**\n"
+                f"   {s['buy']} → {s['sell']}\n"
+                f"   курс: `{s['price_b']}` → `{s['price_s']}`\n")
+        response += line + "—" * 10 + "\n"
 
-    if found_spreads:
-        response = "🚀 **НАЙДЕНЫ СПРЕДЫ**:\n\n"
-        for s in found_spreads[:10]: # Показываем топ-10 спредов
-            sym, b_ex, s_ex, b_p, s_p, spr = s
-            # Формируем красивое сообщение
-            response += (f"🪙 **#{sym.replace('/USDT', '')}** — `{spr:.2f}%` \n"
-                        f"🛒 Купить [{b_ex}]: `{b_p}`\n"
-                        f"💰 Продать [{s_ex}]: `{s_p}`\n"
-                        f"📊 Чистый профит (прим): ~{spr-0.2:.2f}%\n"
-                        f"-------------------\n")
-        await status_msg.edit_text(response, parse_mode="Markdown")
-    else:
-        await status_msg.edit_text("💡 Сканирование завершено. Хороших спредов (>0.01%) не найдено.")
+    # Лимит сообщения в ТГ — 4096 символов, обрезаем если надо
+    await msg.edit_text(response[:4090], parse_mode="Markdown")
 
 async def main():
-    print("🤖 Сканер цен запущен!")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        print("Сканер остановлен")
+    asyncio.run(main())
