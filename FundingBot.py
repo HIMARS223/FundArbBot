@@ -9,7 +9,7 @@ import ccxt.async_support as ccxt
 # Решаем проблему с Protobuf программно
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 
-API_TOKEN = 'ТВОЙ_ТОКЕН_БОТА' # Получи у @BotFather
+API_TOKEN = '8701958512:AAHn1_Eq1MDIaeU7F6wuxTBXX33mgRkXzXM' # Получи у @BotFather
 
 # Настройки для обхода блокировок (User-Agent и таймауты)
 EXCHANGE_CONFIG = {
