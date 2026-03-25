@@ -1,4 +1,2 @@
-pyTelegramBotAPI
+aiogram
 ccxt
-pandas
-aiohttp
