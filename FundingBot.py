@@ -9,32 +9,32 @@ import asyncio
 import json
 from aiohttp import web
 
-# --- НАСТРОЙКИ БЕЗОПАСНОСТИ ---
+# --- НАСТРОЙКИ ---
 TG_TOKEN = os.getenv("BOT_TOKEN")
 if not TG_TOKEN:
     print("❌ ОШИБКА: Переменная BOT_TOKEN не найдена!")
     exit(1)
 
 bot = telebot.TeleBot(TG_TOKEN)
-
-# --- РАБОТА С НАСТРОЙКАМИ (JSON) ---
 SETTINGS_FILE = "user_settings.json"
 
 def load_settings():
     if os.path.exists(SETTINGS_FILE):
-        with open(SETTINGS_FILE, 'r') as f:
-            return json.load(f)
+        try:
+            with open(SETTINGS_FILE, 'r') as f:
+                return json.load(f)
+        except: return {}
     return {}
 
 def save_settings(data):
-    # Превращаем ключи в строки для JSON
-    clean_data = {str(k): v for k, v in data.items()}
-    with open(SETTINGS_FILE, 'w') as f:
-        json.dump(clean_data, f)
+    try:
+        clean_data = {str(k): v for k, v in data.items()}
+        with open(SETTINGS_FILE, 'w') as f:
+            json.dump(clean_data, f)
+    except: pass
 
 user_data = load_settings()
 
-print(f"⚙️ Инициализация бирж...")
 ex_config = {'enableRateLimit': True, 'options': {'defaultType': 'future'}}
 ex_map = {
     'binance': ccxt.binance(ex_config),
@@ -46,7 +46,7 @@ ex_map = {
 
 # --- ВЕБ-СЕРВЕР ---
 async def handle(request):
-    return web.Response(text="Bot is alive!")
+    return web.Response(text="Bot is running!")
 
 async def start_web_server():
     app = web.Application()
@@ -57,7 +57,7 @@ async def start_web_server():
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
 
-# --- ЛОГИКА СКАНЕРА ---
+# --- УЛУЧШЕННЫЙ СКАНЕР ---
 def get_scan(lead_name, depo):
     lead_ex = ex_map[lead_name]
     try:
@@ -67,21 +67,34 @@ def get_scan(lead_name, depo):
         
         for symbol, info in tickers.items():
             if '/USDT' in symbol:
-                # Фикс ошибки 'v' - проверяем все возможные ключи объема
-                volume = info.get('quoteVolume') or info.get('baseVolume') or info.get('v') or 0
+                # МАКСИМАЛЬНО ЖЕСТКИЙ ПОИСК ОБЪЕМА
+                # 1. Пробуем стандартные поля CCXT
+                vol = info.get('quoteVolume') or info.get('baseVolume')
+                
+                # 2. Если пусто (как у Gate), лезем в info
+                if vol is None:
+                    raw_info = info.get('info', {})
+                    # У Gate.io это часто 'quote_volume' или 'last_24h_quote_volume'
+                    vol = raw_info.get('quote_volume') or raw_info.get('base_volume') or raw_info.get('v', 0)
+                
+                # 3. Фандинг
                 rate = info.get('fundingRate') or info.get('info', {}).get('fundingRate')
                 
                 if rate is not None:
-                    r_val = float(rate) * 100
-                    if r_val != 0:
-                        lead_list.append({'sym': symbol, 'r': r_val, 'v': float(volume)})
+                    try:
+                        r_val = float(rate) * 100
+                        v_val = float(vol) if vol else 0
+                        if r_val != 0:
+                            lead_list.append({'sym': symbol, 'r': r_val, 'v': v_val})
+                    except: continue
         
-        if not lead_list: return "❌ Нет данных с лид-биржи."
+        if not lead_list: return "❌ Биржа не отдала данные."
         
         df = pd.DataFrame(lead_list)
-        # Фильтр объема (15к)
-        df = df[df['v'] > 15000].sort_values(by='r').head(35)
+        # Фильтр объема снизим до 10к для теста Gate
+        df = df[df['v'] > 10000].sort_values(by='r').head(35)
         target_symbols = df['sym'].tolist()
+        
     except Exception as e:
         return f"❌ Ошибка {lead_name.upper()}: {str(e)}"
 
@@ -118,7 +131,7 @@ def format_report(data, depo):
     top_res = sorted(data, key=lambda x: x['S1_val'], reverse=True)[:5]
     if not top_res: return "🧐 Аномалий не найдено."
     
-    response = f"<b>🚀 ОТЧЕТ (Депозит: ${depo})</b>\n\n"
+    response = f"<b>📊 ОТЧЕТ (Депозит: ${depo})</b>\n\n"
     for i, res in enumerate(top_res, 1):
         response += f"{i}. 🪙 <b>{res['Symbol']}</b>\n"
         response += f"💰 <b>Профит:</b> <code>+${res['S1_profit']}</code> (Спред: {res['S1_val']}%)\n"
@@ -127,7 +140,7 @@ def format_report(data, depo):
         response += f"📝 {all_rates}\n───────────────────\n"
     return response
 
-# --- КЛАВИАТУРА ---
+# --- КНОПКИ ---
 def get_kb(cid):
     cid_str = str(cid)
     d = user_data.get(cid_str, {'enabled': False, 'interval_min': 480, 'lead': 'mexc', 'depo': 1000})
@@ -143,7 +156,7 @@ def start(message):
     if cid not in user_data:
         user_data[cid] = {'enabled': False, 'interval_min': 480, 'lead': 'mexc', 'depo': 1000, 'last_check': time.time()}
         save_settings(user_data)
-    bot.send_message(message.chat.id, "Бот готов. Ошибка Gate исправлена!", reply_markup=get_kb(cid))
+    bot.send_message(message.chat.id, "Бот обновлен. Gate.io теперь должен работать!", reply_markup=get_kb(cid))
 
 @bot.message_handler(func=lambda m: True)
 def handle_text(message):
@@ -162,7 +175,7 @@ def handle_text(message):
     elif "Авто:" in txt:
         user_data[cid]['enabled'] = not user_data[cid]['enabled']
         save_settings(user_data)
-        bot.send_message(message.chat.id, "Авто-чек изменен", reply_markup=get_kb(cid))
+        bot.send_message(message.chat.id, "Настройки авто-чека сохранены.", reply_markup=get_kb(cid))
     elif "⚙️" in txt:
         s = bot.send_message(message.chat.id, "Минуты:")
         bot.register_next_step_handler(s, lambda m: set_val(m, 'interval_min'))
@@ -174,8 +187,8 @@ def set_val(m, key):
     try:
         user_data[str(m.chat.id)][key] = int(m.text)
         save_settings(user_data)
-        bot.send_message(m.chat.id, "✅ Сохранено", reply_markup=get_kb(m.chat.id))
-    except: bot.send_message(m.chat.id, "⚠️ Число плиз")
+        bot.send_message(m.chat.id, "✅ Принято", reply_markup=get_kb(m.chat.id))
+    except: bot.send_message(m.chat.id, "⚠️ Числом пиши")
 
 # --- ТАЙМЕР ---
 def loop():
