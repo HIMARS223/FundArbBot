@@ -1,102 +1,79 @@
 import asyncio
-import logging
 import os
-import json
-from aiogram import Bot
+import logging
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
 import ccxt.async_support as ccxt
-from aiohttp import web
 
-# --- НАСТРОЙКИ (Берем из среды) ---
-API_TOKEN = os.getenv('BOT_TOKEN') # Скрытый токен
-CHAT_ID = os.getenv('CHAT_ID')     # Твой ID (тоже лучше скрыть)
+# --- [НАСТРОЙКИ] ---
+# Решаем проблему с Protobuf программно
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 
-if not API_TOKEN:
-    print("❌ ОШИБКА: Переменная BOT_TOKEN не найдена!")
-    exit(1)
+API_TOKEN = 'ТВОЙ_ТОКЕН_БОТА' # Получи у @BotFather
 
-THRESHOLD = 1.2  
-SLEEP_BETWEEN_SYMBOLS = 0.2 
+# Настройки для обхода блокировок (User-Agent и таймауты)
+EXCHANGE_CONFIG = {
+    'enableRateLimit': True,
+    'timeout': 30000,
+    'headers': {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+}
+# --------------------
 
-bot = Bot(token=API_TOKEN)
 logging.basicConfig(level=logging.INFO)
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher()
 
-# --- ВЕБ-СЕРВЕР (Для облачных хостингов) ---
-async def handle(request):
-    return web.Response(text="Arbitrage Bot is running...")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    # Автоматический выбор порта (Render дает свой, иначе 10000)
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    print(f"🌐 Веб-сервер запущен на порту {port}")
-
-# --- ЛОГИКА АРБИТРАЖА ---
-async def get_common_symbols(ex1, ex2):
-    await ex1.load_markets()
-    await ex2.load_markets()
-    symbols1 = [s for s in ex1.symbols if '/USDT' in s and ':' not in s]
-    symbols2 = [s for s in ex2.symbols if '/USDT' in s and ':' not in s]
-    return list(set(symbols1).intersection(symbols2))
-
-async def check_pair(ex1, ex2, symbol):
-    try:
-        t1, t2 = await asyncio.gather(
-            ex1.fetch_ticker(symbol),
-            ex2.fetch_ticker(symbol)
-        )
-        # Спред 1: Покупка Bybit, продажа MEXC
-        spread1 = ((t2['bid'] - t1['ask']) / t1['ask']) * 100
-        # Спред 2: Покупка MEXC, продажа Bybit
-        spread2 = ((t1['bid'] - t2['ask']) / t2['ask']) * 100
-
-        if spread1 > THRESHOLD:
-            await send_alert(symbol, "Bybit", "MEXC", t1['ask'], t2['bid'], spread1)
-        if spread2 > THRESHOLD:
-            await send_alert(symbol, "MEXC", "Bybit", t2['ask'], t1['bid'], spread2)
-    except:
-        pass
-
-async def send_alert(symbol, buy_ex, sell_ex, buy_p, sell_p, spread):
-    text = (f"🚀 **Найден спред: {spread:.2f}%**\n"
-            f"💎 Пара: #{symbol.replace('/USDT', '')}\n\n"
-            f"🛒 Купить [{buy_ex}]: `{buy_p}`\n"
-            f"💰 Продать [{sell_ex}]: `{sell_p}`\n"
-            f"📊 Чистый профит (прим): ~{spread-0.2:.2f}%")
-    try:
-        await bot.send_message(CHAT_ID, text, parse_mode="Markdown")
-    except Exception as e:
-        logging.error(f"Ошибка отправки в ТГ: {e}")
-
-async def scanner_loop():
-    bybit = ccxt.bybit({'enableRateLimit': True})
-    mexc = ccxt.mexc({'enableRateLimit': True})
+async def get_common_pairs():
+    """Функция парсинга общих монет"""
+    binance = ccxt.binance(EXCHANGE_CONFIG)
+    mexc = ccxt.mexc(EXCHANGE_CONFIG)
     
-    print("🔄 Загрузка общих пар...")
-    symbols = await get_common_symbols(bybit, mexc)
-    print(f"✅ Найдено {len(symbols)} пар. Мониторинг запущен.")
-
-    while True:
-        for symbol in symbols:
-            await check_pair(bybit, mexc, symbol)
-            await asyncio.sleep(SLEEP_BETWEEN_SYMBOLS)
+    try:
+        # Загружаем рынки параллельно для скорости
+        await asyncio.gather(binance.load_markets(), mexc.load_markets())
         
-        print("♻️ Круг завершен. Рестарт через 10 сек...")
-        await asyncio.sleep(10)
+        # Фильтруем только Spot USDT
+        b_pairs = {s for s in binance.symbols if '/USDT' in s and ':' not in s}
+        m_pairs = {s for s in mexc.symbols if '/USDT' in s and ':' not in s}
+        
+        common = sorted(list(b_pairs.intersection(m_pairs)))
+        return common
+    except Exception as e:
+        logging.error(f"Ошибка парсинга: {e}")
+        return None
+    finally:
+        await binance.close()
+        await mexc.close()
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer("Привет! Напиши /parse, чтобы я нашел общие монеты на Binance и MEXC.")
+
+@dp.message(Command("parse"))
+async def cmd_parse(message: types.Message):
+    status_msg = await message.answer("🔍 Опрашиваю биржи, подожди...")
+    
+    pairs = await get_common_pairs()
+    
+    if pairs:
+        count = len(pairs)
+        # ТГ не даст отправить слишком длинное сообщение, берем первые 80 монет
+        list_str = "\n".join(pairs[:80]) 
+        response = (f"✅ Найдено общих пар: **{count}**\n\n"
+                    f"**Топ монет для работы:**\n`{list_str}`\n\n"
+                    f"🔗 _Показаны первые 80 из {count}_")
+        await status_msg.edit_text(response, parse_mode="Markdown")
+    else:
+        await status_msg.edit_text("❌ Не удалось получить данные. Проверь логи сервера или IP региона.")
 
 async def main():
-    # Запуск сервера и сканера одновременно
-    await asyncio.gather(
-        start_web_server(),
-        scanner_loop()
-    )
+    print("🤖 Бот запущен и ждет команд...")
+    await dp.start_polling(bot)
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    except (KeyboardInterrupt, SystemExit):
+        print("Бот остановлен")
