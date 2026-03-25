@@ -61,50 +61,72 @@ async def start_web_server():
 def get_scan(lead_name, depo):
     lead_ex = ex_map[lead_name]
     try:
-        lead_ex.load_markets()
-        tickers = lead_ex.fetch_tickers()
-        lead_list = []
+        # 1. Силовая подгрузка рынков
+        lead_ex.load_markets(True) 
+        time.sleep(1) # Даем бирже "продышаться"
         
+        tickers = lead_ex.fetch_tickers()
+        
+        # Если пусто, пробуем альтернативный метод (только для Gate)
+        if not tickers and lead_name == 'gateio':
+            # Прямой запрос к API через внутренние методы CCXT
+            tickers = lead_ex.public_get_tickers()
+            # Превращаем в формат, похожий на обычный ответ
+            if isinstance(tickers, list):
+                tickers = {t['currency_pair']: {'info': t} for t in tickers}
+
+        lead_list = []
         for symbol, info in tickers.items():
-            if '/USDT' in symbol:
-                # МАКСИМАЛЬНО ЖЕСТКИЙ ПОИСК ОБЪЕМА
-                # 1. Пробуем стандартные поля CCXT
-                vol = info.get('quoteVolume') or info.get('baseVolume')
+            # Фильтр пар (у Gate фьючерсы могут быть без косой черты, например 'BTC_USDT')
+            if 'USDT' in symbol:
+                raw_info = info.get('info', info)
                 
-                # 2. Если пусто (как у Gate), лезем в info
-                if vol is None:
-                    raw_info = info.get('info', {})
-                    # У Gate.io это часто 'quote_volume' или 'last_24h_quote_volume'
-                    vol = raw_info.get('quote_volume') or raw_info.get('base_volume') or raw_info.get('v', 0)
+                # Поиск объема (Gate: quote_volume, volume_24h_quote)
+                vol = info.get('quoteVolume') or raw_info.get('quote_volume') or \
+                      raw_info.get('last_24h_quote_volume') or raw_info.get('v') or 0
                 
-                # 3. Фандинг
-                rate = info.get('fundingRate') or info.get('info', {}).get('fundingRate')
+                # Поиск фандинга
+                rate = info.get('fundingRate') or raw_info.get('funding_rate') or \
+                       raw_info.get('last_funding_rate')
                 
                 if rate is not None:
                     try:
                         r_val = float(rate) * 100
-                        v_val = float(vol) if vol else 0
+                        v_val = float(vol)
                         if r_val != 0:
                             lead_list.append({'sym': symbol, 'r': r_val, 'v': v_val})
                     except: continue
         
-        if not lead_list: return "❌ Биржа не отдала данные."
+        if not lead_list:
+            # Если всё еще пусто, попробуем вывести первые 2 ключа для отладки в консоль
+            print(f"DEBUG {lead_name.upper()}: Ключи в ответе: {list(tickers.keys())[:2]}")
+            return "❌ Биржа не отдала данные (пустой список)."
         
         df = pd.DataFrame(lead_list)
-        # Фильтр объема снизим до 10к для теста Gate
-        df = df[df['v'] > 10000].sort_values(by='r').head(35)
+        # Уменьшим порог объема до 5000 для отладки Gate
+        df = df[df['v'] > 5000].sort_values(by='r').head(35)
         target_symbols = df['sym'].tolist()
         
     except Exception as e:
         return f"❌ Ошибка {lead_name.upper()}: {str(e)}"
 
     results = []
+    # Далее цикл сверки (оставляем как был)
     for symbol in target_symbols:
         rates_only = {}
         for name, ex in ex_map.items():
             try:
-                if symbol not in ex.markets: continue
-                f_data = ex.fetch_funding_rate(symbol)
+                # Универсальная проверка символа
+                if symbol not in ex.markets:
+                    # Пробуем заменить '_' на '/' или наоборот
+                    alt_sym = symbol.replace('_', '/') if '_' in symbol else symbol.replace('/', '_')
+                    if alt_sym in ex.markets: 
+                        target_sym = alt_sym
+                    else: continue
+                else:
+                    target_sym = symbol
+                
+                f_data = ex.fetch_funding_rate(target_sym)
                 rate = f_data.get('fundingRate')
                 if rate is not None:
                     val = round(float(rate) * 100, 6)
@@ -123,7 +145,7 @@ def get_scan(lead_name, depo):
                 'all': rates_only
             }
             results.append(res)
-        time.sleep(0.5)
+        time.sleep(0.4)
     return results
 
 def format_report(data, depo):
